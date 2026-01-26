@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebRTC Peer Chat</title>
+<style>
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #0f0f12;
+  color: #e5e5e5;
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  height: 100vh;
+}
+
+#peers {
+  border-right: 1px solid #222;
+  padding: 10px;
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+th, td {
+  padding: 6px;
+  border-bottom: 1px solid #222;
+  text-align: left;
+}
+
+tr:hover {
+  background: #1b1b22;
+  cursor: pointer;
+}
+
+.online { color: #4ade80; }
+.offline { color: #f87171; }
+
+#chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+#log {
+  flex: 1;
+  padding: 10px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
+#input {
+  display: flex;
+  border-top: 1px solid #222;
+}
+
+#input input {
+  flex: 1;
+  padding: 10px;
+  border: none;
+  outline: none;
+  background: #121218;
+  color: #e5e5e5;
+}
+
+#input button {
+  padding: 10px 16px;
+  border: none;
+  background: #2563eb;
+  color: white;
+  cursor: pointer;
+}
+
+#answerBtn {
+  padding: 6px;
+  margin: 5px 0;
+  border: none;
+  background: #f59e0b;
+  color: white;
+  cursor: pointer;
+}
+</style>
+</head>
+<body>
+
+<div id="peers">
+  <h3>Peers</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>UID</th>
+        <th>Status</th>
+        <th>RTC</th>
+      </tr>
+    </thead>
+    <tbody id="peerRows"></tbody>
+  </table>
+</div>
+
+<div id="chat">
+  <div id="log"></div>
+  <button id="answerBtn" style="display:none;">Send Answer</button>
+  <div id="input">
+    <input id="msg" placeholder="Select a peer and type…" disabled>
+    <button id="send" disabled>Send</button>
+  </div>
+</div>
+
+<script src="net.js"></script>
+<script>
+/* ===========================
+   MANUAL BIT-PACK COMPRESSION
+   =========================== */
+function pack7(str) {
+  let ascii = true;
+  for (const c of str) if (c.charCodeAt(0) > 127) ascii = false;
+  if (!ascii) {
+    const b = new TextEncoder().encode(str);
+    const out = new Uint8Array(1 + b.length);
+    out[0] = 0; // raw
+    out.set(b, 1);
+    return out;
+  }
+  const bytes = [];
+  let acc = 0, bits = 0;
+  for (let i = 0; i < str.length; i++) {
+    acc |= (str.charCodeAt(i) & 0x7f) << bits;
+    bits += 7;
+    while (bits >= 8) {
+      bytes.push(acc & 0xff);
+      acc >>= 8;
+      bits -= 8;
+    }
+  }
+  if (bits > 0) bytes.push(acc);
+  return Uint8Array.from([1, ...bytes]);
+}
+
+function unpack7(buf) {
+  if (buf[0] === 0) return new TextDecoder().decode(buf.slice(1));
+  let acc = 0, bits = 0;
+  let out = "";
+  for (let i = 1; i < buf.length; i++) {
+    acc |= buf[i] << bits;
+    bits += 8;
+    while (bits >= 7) {
+      out += String.fromCharCode(acc & 0x7f);
+      acc >>= 7;
+      bits -= 7;
+    }
+  }
+  return out;
+}
+
+/* ===========================
+   BACKEND (paste as provided)
+   =========================== */
+
+/* ===========================
+   UI + RTC GLUE WITH CHAT BUFFERS
+   =========================== */
+
+const peerRows = document.getElementById("peerRows");
+const log = document.getElementById("log");
+const msg = document.getElementById("msg");
+const send = document.getElementById("send");
+const answerBtn = document.getElementById("answerBtn");
+
+let selected = null;
+
+function renderPeers() {
+  peerRows.innerHTML = "";
+  for (const p of peers.values()) {
+    const tr = document.createElement("tr");
+    tr.onclick = () => selectPeer(p);
+    tr.innerHTML = `
+      <td>${p.uid.slice(0, 8)}</td>
+      <td class="${p.state}">${p.state}</td>
+      <td>${p.rtc}</td>
+    `;
+    peerRows.appendChild(tr);
+  }
+}
+
+function selectPeer(p) {
+  selected = p;
+
+  // Initialize chat buffer if missing
+  if (!p.chat) p.chat = [];
+
+  log.textContent = p.chat.join("\n");
+
+  // Chat input only enabled if connected
+  msg.disabled = !p.chan || p.chan.readyState !== "open";
+  send.disabled = msg.disabled;
+
+  // Show answer button if offer pending
+  answerBtn.style.display = (p.offer && p.rtc === "answering") ? "block" : "none";
+
+  if (p.rtc === "idle") makeOffer(p);
+}
+
+function append(text, from) {
+  if (!selected) return;
+  const line = `[${from}] ${text}`;
+  selected.chat.push(line);
+  if (selected === selected) log.textContent = selected.chat.join("\n");
+  log.scrollTop = log.scrollHeight;
+}
+
+send.onclick = () => {
+  if (!selected?.chan) return;
+  const data = pack7(msg.value);
+  selected.chan.send(data);
+  append(msg.value, "me");
+  msg.value = "";
+};
+
+msg.onkeydown = e => e.key === "Enter" && send.click();
+
+/* Attach data channel handlers */
+const _mkPC = mkPC;
+mkPC = function (p) {
+  _mkPC(p);
+  bindChannel(p);
+};
+
+function bindChannel(p) {
+  const ch = p.chan;
+  if (!ch) return;
+
+  ch.binaryType = "arraybuffer";
+
+  ch.onopen = () => {
+    if (p === selected) {
+      msg.disabled = false;
+      send.disabled = false;
+    }
+  };
+
+  ch.onmessage = e => {
+    const buf = new Uint8Array(e.data);
+    append(unpack7(buf), p.uid.slice(0, 8));
+  };
+
+  ch.onclose = () => {
+    if (p === selected) {
+      msg.disabled = true;
+      send.disabled = true;
+    }
+  };
+}
+
+/* Patch answer-side channel and manual offer handling */
+const _takeOffer = takeOffer;
+takeOffer = async function (p, data) {
+  p.rtc = "answering";  // block auto-answer
+  p.offer = data;
+  selectPeer(p);         // refresh UI for answer button
+};
+
+answerBtn.onclick = async () => {
+  if (!selected || !selected.offer) return;
+  await _takeOffer(selected, selected.offer);
+  selected.offer = null;
+  answerBtn.style.display = "none";
+  bindChannel(selected);
+};
+
+/* UI refresh loop */
+setInterval(renderPeers, 500);
+
+/* Start network */
+Net();
+</script>
+</body>
+</html>
