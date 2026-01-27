@@ -1,6 +1,6 @@
 #!/bin/bash
-
-HTML_FILE="ahh.html"
+log() { echo "[build] $1"; }
+HTML_FILE="source/chats.html"
 OUTPUT_FILE="ui.section"
 
 if [ ! -f "$HTML_FILE" ]; then
@@ -23,6 +23,7 @@ else
 fi
 SCRIPT_MINIFIED=$(cat "$TMP_MIN")
 SCRIPT_B64=$(printf '%s' "$SCRIPT_MINIFIED" | base64 -w0)
+log "$HTML_FILE: minified script"
 rm -f "$TMP_JS" "$TMP_MIN"
 
 STYLE=$(sed -n '/<style>/,/<\/style>/p' "$HTML_FILE" | sed '/<style>/d; /<\/style>/d')
@@ -40,17 +41,17 @@ fi
 STYLE_MINIFIED=$(cat "$TMP_CSS_MIN" | tr -d '\n' | sed 's/  */ /g; s/ *{ */{/g; s/ *} */}/g; s/ *: */:/g; s/ *; */;/g; s/ *, */,/g')
 STYLE_B64=$(echo -n "$STYLE_MINIFIED" | base64 -w0)
 rm -f "$TMP_CSS" "$TMP_CSS_MIN"
-
+log "$HTML_FILE: minified styles"
 HTML=$(sed -n '/<body>/,/<\/body>/p' "$HTML_FILE" | sed '/<body>/d; /<\/body>/d; /<style>/,/<\/style>/d; /<script>/,/<\/script>/d')
 HTML_B64=$(echo -n "$HTML" | base64 -w0)
+log "$HTML_FILE: minified struct"
 
 cat > "$OUTPUT_FILE" << EOF
-      document.head.querySelector('style').remove();
+      document.head.querySelectorAll("style").forEach(e=>e.remove());
       document.head.appendChild(Object.assign(document.createElement('style'), {innerText:atob("$STYLE_B64")}));
-      document.body.innerHTML = atob('$HTML_B64')
-      let uri = URL.createObjectURL(new Blob([atob("$SCRIPT_B64")]))
-      document.head.appendChild(Object.assign(document.createElement('script'), {src:uri}))
+      document.body.innerHTML = atob('$HTML_B64');
+      let uri = URL.createObjectURL(new Blob([atob("$SCRIPT_B64")]));
+      document.head.appendChild(Object.assign(document.createElement('script'), {src:uri}));
 EOF
 
-echo "✓ Compilation complete!"
-echo "✓ Output written to: $OUTPUT_FILE"
+log "Chat written to: $OUTPUT_FILE"

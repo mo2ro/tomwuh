@@ -1,4 +1,4 @@
-const WS_URL = "wss://4d56834391b5.hbpkcjfv.workers.dev";
+const WS_URL = "";
 const HB_INT = 1000;
 const OFFLINE_MS = 12000;
 
@@ -8,7 +8,7 @@ const PKT_OFFER = 2;
 const PKT_ANSWER = 3;
 const PKT_ICE = 4;
 
-const XOR = new TextEncoder().encode("aESRE43efs"); // make this change later maybe
+const XOR = new TextEncoder().encode("");
 
 function xor(b) {
   const o = new Uint8Array(b.length);
@@ -241,5 +241,3 @@ function checkOffline() {
     }
   }
 }
-// export
-// Object.assign({dropPeer, sigIn, takeOffer, makeOffer, mkPC, sendHB, ws, peers, selfUID, selfUIDBytes, bytesToUid, uidToBytes, now, decStr, encStr, PKT_ANSWER, PKT_HB, PKT_ICE, PKT_OFFER, PROTO, WS_URL, OFFLINE_MS, HB_INT}, globalThis)
