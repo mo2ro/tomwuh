@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-sh compile.sh
+sh source/compile.sh
 set -eu
 
 die() { echo "[fatal] $1" >&2; exit 1; }
@@ -67,7 +67,7 @@ LTM=$(sed \
   "$LOGIN_HTML" | base64 -w 0)
 
 UIA=$(sed ':a;N;$!ba;s/\n/ /g' "$UI_SECTION")
-
+rm ui.section
 log "processing fonts"
 DWF=""
 

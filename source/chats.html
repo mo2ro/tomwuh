@@ -1,577 +1,712 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>WebRTC Secure Chat</title>
-
-<style>
-
-@keyframes bg {
-    0% {
-      background-position: 0px 0px;  
-    }  100% {
-      background-position: 0px 100px;  
-    }
-  }
-
-body {
-    margin: 0;
-    font-family: system-ui, sans-serif;
-    color: #eaeaea;
-    display: flex;
-    height: 100vh;
-    background: repeating-conic-gradient(#6b5800 0 25%, #01004e 0 50%) 0 0 / 100px 100px;
-    animation: 6.7s ease -1880.14ms infinite normal none running bg;
-    animation-timing-function: linear;
-    font-family: Courier, monospace;
-    font-weight: 600;
-}
-
-button {
-  font-family: Courier, monospace;
-  font-weight: 600;
-  background:#1e1e1e;
-  color: #eaeaea;
-  outline:none;
-  border: 2px solid #444;
-  padding:4px 8px;
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-#peers {
-  width: 350px;
-  border-right: 1px solid #222;
-  overflow-y: auto;
-  background: rgba(12, 12, 12, 1);
-}
-
-.peer {
-  padding: 10px;
-  border-bottom: 1px solid #1c1c1c;
-}
-.peer.active { background: #1b1b1b; }
-.peer small { opacity: 0.7; }
-
-#chat {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  background: rgba(0, 0, 0, 0.84);
-}
-
-#messages {
-  flex: 1;
-  padding: 12px;
-  overflow-y: auto;
-}
-
-#msg {
-  width:100%;
-  font-family: Courier, monospace;
-  font-weight: 600;
-}
-
-input#msg:focus {
-    outline: none;
-    background: #e1e1a9
-}
-
-.msg {
-  padding: 4px 6px;
-  border-radius: 4px;
-}
-.msg:hover {
-  background: #1e1e1e;
-}
-
-#replyIndicator {
-  font-size: 0.85em;
-  padding: 6px 12px;
-  border-top: 1px solid #222;
-  background: #111;
-  display: none;
-}
-
-.reply-preview {
-  font-size: 0.8em;
-  opacity: 0.7;
-  padding-left: 8px;
-  border-left: 2px solid #444;
-  margin-bottom: 2px;
-}
-
-/* Typing indicator */
-#typingIndicator {
-  font-size: 0.8em;
-  opacity: 0.7;
-  padding: 4px 12px;
-  text-align: right;
-  display: none;
-}
-
-.sender { font-weight: 600; margin-right: 6px; }
-
-.file {
-  cursor: pointer;
-  text-decoration: underline;
-}
-
-.progress {
-  opacity: 0.7;
-  font-size: 0.9em;
-}
-
-#input {
-  display: flex;
-  border-top: 1px solid #222;
-}
-#input input[type="text"] {
-  flex: 1;
-  padding: 12px;
-  background: #111;
-  border: none;
-  color: #fff;
-}
-#input button {
-  padding: 12px 18px;
-  background: #222;
-  color: #fff;
-  border: none;
-}
-</style>
-</head>
-<body>
-
-<div id="peers"></div>
-
-<div id="chat">
-  <div id="messages"></div>
-  <div id="replyIndicator"></div>
-  <div id="typingIndicator">typing</div>
-  <div id="input">
-    <input id="msg" placeholder="Type message..." disabled>
-    <input id="file" type="file" hidden>
-    <button id="send" disabled>Send</button>
-    <button id="sendFile" disabled>File</button>
-  </div>
-</div>
-<script src="net.js"></script>
-<script>
-/* ================= CONSTANTS ================= */
-const CHUNK_SIZE = 16 * 1024;
-
-/* ================= UI STATE ================= */
-const peersDiv = document.getElementById("peers");
-const msgs = document.getElementById("messages");
-const msgInput = document.getElementById("msg");
-const sendBtn = document.getElementById("send");
-const sendFileBtn = document.getElementById("sendFile");
-const fileInput = document.getElementById("file");
-let replyTo = null;
-let typingTimers = {};
-let lastInputValue = "";
-
-let currentPeer = null;
-
-/* ================= PEER INIT (CRITICAL) ================= */
-function ensurePeerState(p) {
-  if (!p.chat) p.chat = [];
-  if (!p._rtcLock) p._rtcLock = false;
-  if (!p._chanBound) p._chanBound = false;
-  if (!p.lastOpened) p.lastOpened = 0;
-  if (p.unread == null) p.unread = 0;
-}
-
-/* ================= UTIL ================= */
-function randId(len = 12) {
-  const c = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let s = "";
-  for (let i = 0; i < len; i++) s += c[Math.random() * c.length | 0];
-  return s;
-}
-
-function formatTime(ts) {
-  const d = new Date(ts);
-  const now = new Date();
-  const sameDay = d.toDateString() === now.toDateString();
-  const t = d.toTimeString().slice(0, 8);
-  if (sameDay) return `[${t}]`;
-  return `[${String(d.getDate()).padStart(2,"0")}/${String(d.getMonth()+1).padStart(2,"0")} ${t}]`;
-}
-
-function stableColor(uid) {
-  let h = 0;
-  for (const c of uid) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  return `hsl(${h % 360},70%,65%)`;
-}
-
-/* ================= E2EE ================= */
-async function deriveKey(secret) {
-  const enc = new TextEncoder().encode(secret);
-  const hash = await crypto.subtle.digest("SHA-256", enc);
-  return crypto.subtle.importKey("raw", hash, "AES-GCM", false, ["encrypt", "decrypt"]);
-}
-
-async function encrypt(key, obj) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const data = new TextEncoder().encode(JSON.stringify(obj));
-  const buf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
-  return { iv: [...iv], data: [...new Uint8Array(buf)] };
-}
-
-async function decrypt(key, payload) {
-  const iv = new Uint8Array(payload.iv);
-  const data = new Uint8Array(payload.data);
-  const buf = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
-  return JSON.parse(new TextDecoder().decode(buf));
-}
-
-/* ================= RTC CHANNEL BINDING ================= */
-function bindChannel(p) {
-  if (p._chanBound || !p.chan) return;
-  p._chanBound = true;
-
-  p.secret = selfUID < p.uid ? selfUID + p.uid : p.uid + selfUID;
-
-  // assign onopen immediately so both offerer and answerer won't miss it
-  p.chan.onopen = async () => {
-    // wait a short while for key derivation to complete
-    const start = Date.now();
-    while (!p.key && Date.now() - start < 3000) await new Promise(r => setTimeout(r, 100));
-    p._rtcLock = false;
-    if (currentPeer === p.uid) setChatEnabled(true);
-    renderPeers();
-  };
-
-  deriveKey(p.secret).then(key => {
-    p.key = key;
-    p.chan.onmessage = e => onChannelMessage(p, e.data);
-
-    p.chan.onclose = () => {
-      p._rtcLock = false;
-      if (currentPeer === p.uid) setChatEnabled(false);
-      renderPeers();
-    };
-  });
-}
-
-/* ================= CHANNEL HANDLER ================= */
-async function onChannelMessage(p, data) {
-  if (typeof data === "string") {
-    const msg = await decrypt(p.key, JSON.parse(data));
-
-    if (msg.type === "chat") {
-      if (msg.username != null) p.username = msg.username;
-      p.chat.push(msg);
-      if (msg.from !== selfUID && currentPeer !== p.uid) {
-        p.unread++;
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      @keyframes bg {
+        0% {
+          background-position: 0px 0px;
+        }
+        100% {
+          background-position: 0px 100px;
+        }
       }
-      if (currentPeer === p.uid) renderChatMessage(msg);
-      p.typing = false;
-      p.lastOpened = Date.now();
-      updateTypingIndicator(p);
-      p.typing = false;
-      refreshTypingUI();
-    }
 
-    if (msg.type === "file-meta") {
-      p._fileRx = { ...msg, received: 0, chunks: [] };
-      renderFileProgress(p, 0);
-    }
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        color: #eaeaea;
+        display: flex;
+        height: 100vh;
+        background: repeating-conic-gradient(#6b5800 0 25%, #01004e 0 50%) 0 0 /
+          100px 100px;
+        animation: 6.7s ease -1880.14ms infinite normal none running bg;
+        animation-timing-function: linear;
+        font-family: Courier, monospace;
+        font-weight: 600;
+      }
 
-    if (msg.type === "file-end") {
-      const f = p._fileRx;
-      const blob = new Blob(f.chunks, { type: f.mime });
-      const url = URL.createObjectURL(blob);
-      p.chat.push({ file: true, name: f.name, url, ts: f.ts, from: p.uid });
-      renderFileLink(p.uid, f.name, url, f.ts);
-      p._fileRx = null;
-    }
+      button {
+        font-family: Courier, monospace;
+        font-weight: 600;
+        background: #1e1e1e;
+        color: #eaeaea;
+        outline: none;
+        border: 2px solid #444;
+        padding: 4px 8px;
+      }
 
-    if (msg.type === "typing") {
-      p.typing = msg.action === "typing";
-      if (currentPeer === p.uid) refreshTypingUI();
-      renderPeers();
-      return;
-    }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      #peers {
+        width: 350px;
+        border-right: 1px solid #222;
+        overflow-y: auto;
+        background: rgba(12, 12, 12, 1);
+      }
 
-    
+      .peer {
+        padding: 10px;
+        border-bottom: 1px solid #1c1c1c;
+      }
+      .peer.active {
+        background: #1b1b1b;
+      }
+      .peer small {
+        opacity: 0.7;
+      }
 
-    return;
-  }
+      #chat {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        background: rgba(0, 0, 0, 0.84);
+      }
 
-  if (p._fileRx) {
-    p._fileRx.chunks.push(data);
-    p._fileRx.received += data.byteLength;
-    renderFileProgress(p, Math.floor((p._fileRx.received / p._fileRx.size) * 100));
-  }
-}
+      #messages {
+        flex: 1;
+        padding: 12px;
+        overflow-y: auto;
+      }
 
-function updateTypingIndicator(p) {
-  const el = document.getElementById("typingIndicator");
-  const displayName = p.username || p.uid.slice(0,8);
-  el.innerHTML = `<span style="color:${stableColor(p.uid)}">${displayName}</span>` + " is typing...";
-  el.style.display = p.typing ? "block" : "none";
-}
+      #msg {
+        width: 100%;
+        font-family: Courier, monospace;
+        font-weight: 600;
+        min-height: 36px;
+        max-height: 140px;
+        height: 36px;
+        padding: 8px 12px;
+        background: #111;
+        border: none;
+        color: #fff;
+        resize: none;
+        overflow-y: hidden;
+        box-sizing: border-box;
+      }
 
-/* ================= RENDER ================= */
-function setChatEnabled(on) {
-  msgInput.disabled = !on;
-  sendBtn.disabled = !on;
-  sendFileBtn.disabled = !on;
-}
+      textarea#msg:focus {
+        outline: none;
+        background: #0d0446;
+      }
 
-function appendLine(html) {
-  const d = document.createElement("div");
-  d.className = "msg";
-  d.innerHTML = html;
-  msgs.appendChild(d);
-  msgs.scrollTop = msgs.scrollHeight;
-}
+      .msg {
+        padding: 4px 6px;
+        border-radius: 4px;
+        word-wrap:normal;
+      }
 
-function appendMessageDiv(msg, html) {
-  const d = document.createElement("div");
-  d.className = "msg";
-  d.dataset.id = msg.id;
-  d.dataset.from = msg.from;
+      .msg:hover {
+        background: #1e1e1e;
+      }
 
-  d.innerHTML = html;
+      #replyIndicator {
+        font-size: 0.85em;
+        padding: 6px 12px;
+        border-top: 1px solid #222;
+        background: #111;
+        display: none;
+      }
 
-  d.ondblclick = () => {
-    replyTo = msg;
-    showReplyIndicator(msg);
-  };
+      .reply-preview {
+        font-size: 0.8em;
+        opacity: 0.7;
+        padding-left: 8px;
+        border-left: 2px solid #444;
+        margin-bottom: 2px;
+      }
 
-  msgs.appendChild(d);
-  msgs.scrollTop = msgs.scrollHeight;
-}
+      /* Typing indicator */
+      #typingIndicator {
+        font-size: 0.8em;
+        opacity: 0.7;
+        padding: 4px 12px;
+        text-align: right;
+        display: none;
+      }
 
-function findMessageById(p, id) {
-  return p.chat.find(m => m.id === id);
-}
+      .sender {
+        font-weight: 600;
+        margin-right: 6px;
+      }
 
-function renderChatMessage(msg) {
-  const p = peers.get(msg.from === selfUID ? currentPeer : msg.from);
-let replyHTML = "";
+      .file {
+        cursor: pointer;
+        text-decoration: underline;
+      }
 
-if (msg.replyTo && p) {
-  const ref = findMessageById(p, msg.replyTo);
-  if (ref) {
-    const color = stableColor(ref.from);
-    const refPeer = peers.get(ref.from);
-    const refName = refPeer?.username || ref.from.slice(0,8);
-    replyHTML = `
+      .progress {
+        opacity: 0.7;
+        font-size: 0.9em;
+      }
+
+      #input {
+        display: flex;
+        border-top: 1px solid #222;
+      }
+      #input textarea {
+        flex: 1;
+        background: transparent;
+        border: none;
+        color: #fff;
+        padding: 10px 10px;
+      }
+      #input button {
+        padding: 12px 18px;
+        background: #222;
+        color: #fff;
+        border: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="peers"></div>
+
+    <div id="chat">
+      <div id="messages"></div>
+      <div id="replyIndicator"></div>
+      <div id="typingIndicator">typing</div>
+      <div id="input">
+        <textarea id="msg" placeholder="Enter message..." disabled rows="1"></textarea>
+        <input id="file" type="file" hidden />
+        <button id="send" disabled>Send</button>
+        <button id="sendFile" disabled>File</button>
+      </div>
+    </div>
+    <script src="net.js"></script>
+    <script>
+      const CHUNK_SIZE = 16 * 1024;
+      const peersDiv = document.getElementById("peers");
+      const msgs = document.getElementById("messages");
+      const msgInput = document.getElementById("msg");
+      const sendBtn = document.getElementById("send");
+      const sendFileBtn = document.getElementById("sendFile");
+      const fileInput = document.getElementById("file");
+      let replyTo = null;
+      let typingTimers = {};
+      let lastInputValue = "";
+
+      let currentPeer = null;
+      const MAX_MSG_HEIGHT = 140;
+
+      function resizeMsg() {
+        if (!msgInput) return;
+        msgInput.style.height = "auto";
+        const newHeight = Math.min(msgInput.scrollHeight, MAX_MSG_HEIGHT);
+        msgInput.style.height = newHeight + "px";
+        msgInput.style.overflowY = msgInput.scrollHeight > MAX_MSG_HEIGHT ? "auto" : "hidden";
+      }
+
+      function ensurePeerState(p) {
+        if (!p.chat) p.chat = [];
+        if (!p._rtcLock) p._rtcLock = false;
+        if (!p._chanBound) p._chanBound = false;
+        if (!p.lastOpened) p.lastOpened = 0;
+        if (p.unread == null) p.unread = 0;
+      }
+
+      function randId(len = 12) {
+        const c =
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let s = "";
+        for (let i = 0; i < len; i++) s += c[(Math.random() * c.length) | 0];
+        return s;
+      }
+
+      function formatTime(ts) {
+        const d = new Date(ts);
+        const now = new Date();
+        const sameDay = d.toDateString() === now.toDateString();
+        const t = d.toTimeString().slice(0, 8);
+        if (sameDay) return `[${t}]`;
+        return `[${String(d.getDate()).padStart(2, "0")}/${String(
+          d.getMonth() + 1
+        ).padStart(2, "0")} ${t}]`;
+      }
+
+      function stableColor(uid) {
+        let h = 0;
+        for (const c of uid) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+        return `hsl(${h % 360},70%,65%)`;
+      }
+
+      function escapeHtml(s) {
+        if (s == null) return "";
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/\"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function escapeAttr(s) {
+        return escapeHtml(s).replace(/\n/g, " ").replace(/\r/g, " ");
+      }
+
+      function sanitizeMessage(text) {
+        if (text == null) return "";
+        const imgs = [];
+        const withPlaceholders = String(text).replace(/<img\b[^>]*>/gi, (m) => {
+          imgs.push(m);
+          return `<!--IMG${imgs.length - 1}-->`;
+        });
+        let out = escapeHtml(withPlaceholders).replace(/\n/g, "<br/>");
+        imgs.forEach((raw, i) => {
+          try {
+            const div = document.createElement("div");
+            div.innerHTML = raw;
+            const img = div.querySelector("img");
+            if (!img) return;
+            const src = img.getAttribute("src") || "";
+            const alt = img.getAttribute("alt") || "";
+            const width = img.getAttribute("width");
+            const height = img.getAttribute("height");
+
+            // allow only http(s) or data URLs
+            const ok = /^https?:\/\//i.test(src) || /^data:/i.test(src);
+            if (!ok) return;
+
+            let safe = `<img src="${escapeAttr(src)}"`;
+            if (alt) safe += ` alt="${escapeAttr(alt)}"`;
+            if (width && /^\d+$/.test(width)) safe += ` width="${width}"`;
+            if (height && /^\d+$/.test(height)) safe += ` height="${height}"`;
+            safe += "/>";
+
+            out = out.replace(`<!--IMG${i}-->`, safe);
+          } catch (e) {
+            // ignore malformed imgs
+          }
+        });
+
+        return out;
+      }
+
+      async function deriveKey(secret) {
+        const enc = new TextEncoder().encode(secret);
+        const hash = await crypto.subtle.digest("SHA-256", enc);
+        return crypto.subtle.importKey("raw", hash, "AES-GCM", false, [
+          "encrypt",
+          "decrypt",
+        ]);
+      }
+
+      async function encrypt(key, obj) {
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const data = new TextEncoder().encode(JSON.stringify(obj));
+        const buf = await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv },
+          key,
+          data
+        );
+        return { iv: [...iv], data: [...new Uint8Array(buf)] };
+      }
+
+      async function decrypt(key, payload) {
+        const iv = new Uint8Array(payload.iv);
+        const data = new Uint8Array(payload.data);
+        const buf = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv },
+          key,
+          data
+        );
+        return JSON.parse(new TextDecoder().decode(buf));
+      }
+
+      function bindChannel(p) {
+        if (p._chanBound || !p.chan) return;
+        p._chanBound = true;
+
+        p.secret = selfUID < p.uid ? selfUID + p.uid : p.uid + selfUID;
+
+        p.chan.onopen = async () => {
+          const start = Date.now();
+          while (!p.key && Date.now() - start < 3000)
+            await new Promise((r) => setTimeout(r, 100));
+          p._rtcLock = false;
+          if (currentPeer === p.uid) setChatEnabled(true);
+          renderPeers();
+        };
+
+        deriveKey(p.secret).then((key) => {
+          p.key = key;
+          p.chan.onmessage = (e) => onChannelMessage(p, e.data);
+
+          p.chan.onclose = () => {
+            p._rtcLock = false;
+            if (currentPeer === p.uid) setChatEnabled(false);
+            renderPeers();
+          };
+        });
+      }
+
+      async function onChannelMessage(p, data) {
+        if (typeof data === "string") {
+          const msg = await decrypt(p.key, JSON.parse(data));
+
+          if (msg.type === "chat") {
+            if (msg.username != null) p.username = msg.username;
+            p.chat.push(msg);
+            if (msg.from !== selfUID && currentPeer !== p.uid) {
+              p.unread++;
+            }
+            if (currentPeer === p.uid) renderChatMessage(msg);
+            p.typing = false;
+            p.lastOpened = Date.now();
+            updateTypingIndicator(p);
+            p.typing = false;
+            refreshTypingUI();
+          }
+
+          if (msg.type === "file-meta") {
+            p._fileRx = { ...msg, received: 0, chunks: [] };
+            renderFileProgress(p, 0);
+          }
+
+          if (msg.type === "file-end") {
+            const f = p._fileRx;
+            const blob = new Blob(f.chunks, { type: f.mime });
+            const url = URL.createObjectURL(blob);
+            p.chat.push({
+              file: true,
+              name: f.name,
+              url,
+              ts: f.ts,
+              from: p.uid,
+            });
+            renderFileLink(p.uid, f.name, url, f.ts);
+            p._fileRx = null;
+          }
+
+          if (msg.type === "typing") {
+            p.typing = msg.action === "typing";
+            if (currentPeer === p.uid) refreshTypingUI();
+            renderPeers();
+            return;
+          }
+
+          return;
+        }
+
+        if (p._fileRx) {
+          p._fileRx.chunks.push(data);
+          p._fileRx.received += data.byteLength;
+          renderFileProgress(
+            p,
+            Math.floor((p._fileRx.received / p._fileRx.size) * 100)
+          );
+        }
+      }
+
+      function updateTypingIndicator(p) {
+        const el = document.getElementById("typingIndicator");
+        const displayName = p.username || p.uid.slice(0, 8);
+        el.innerHTML =
+          `<span style="color:${stableColor(p.uid)}">${displayName}</span>` +
+          " is typing...";
+        el.style.display = p.typing ? "block" : "none";
+      }
+
+      function setChatEnabled(on) {
+        msgInput.disabled = !on;
+        sendBtn.disabled = !on;
+        sendFileBtn.disabled = !on;
+      }
+
+      function appendLine(html) {
+        const d = document.createElement("div");
+        d.className = "msg";
+        d.innerHTML = html;
+        msgs.appendChild(d);
+        msgs.scrollTop = msgs.scrollHeight;
+      }
+
+      function appendMessageDiv(msg, html) {
+        const d = document.createElement("div");
+        d.className = "msg";
+        d.dataset.id = msg.id;
+        d.dataset.from = msg.from;
+
+        d.innerHTML = html;
+
+        d.ondblclick = () => {
+          replyTo = msg;
+          showReplyIndicator(msg);
+        };
+
+        msgs.appendChild(d);
+        msgs.scrollTop = msgs.scrollHeight;
+      }
+
+      function findMessageById(p, id) {
+        return p.chat.find((m) => m.id === id);
+      }
+
+      function renderChatMessage(msg) {
+        const p = peers.get(msg.from === selfUID ? currentPeer : msg.from);
+        let replyHTML = "";
+
+        if (msg.replyTo && p) {
+          const ref = findMessageById(p, msg.replyTo);
+          if (ref) {
+            const color = stableColor(ref.from);
+            const refPeer = peers.get(ref.from);
+            const refName = refPeer?.username || ref.from.slice(0, 8);
+            replyHTML = `
       <div class="reply-preview">
-        <span style="color:${color}">${refName}</span>: ${ref.text}
+        <span style="color:${color}">${refName}</span>: ${sanitizeMessage(ref.text.split("\n")[0])}
       </div>
     `;
-  }
-}
-  const color = stableColor(msg.from);
-  // Prefer username provided on the message; for local messages use local `window.us`.
-  const sender = msg.username
-    ? msg.username
-    : (msg.from === selfUID ? (window.us || msg.from.slice(0,8)) : (p?.username || msg.from.slice(0,8)));
-  appendMessageDiv(
-  msg,
-  `${replyHTML}<span style="color:gray;">${formatTime(msg.ts)}</span> <span class="sender" style="color:${color}">${sender}</span>: ${msg.text}`
-);
+          }
+        }
+        const color = stableColor(msg.from);
+        const sender = msg.username
+          ? msg.username
+          : msg.from === selfUID
+          ? window.us || msg.from.slice(0, 8)
+          : p?.username || msg.from.slice(0, 8);
+        appendMessageDiv(
+          msg,
+          `${replyHTML}<span style="color:gray;">${formatTime(msg.ts)}</span> <span class="sender" style="color:${color}">${sender}</span>: ${sanitizeMessage(msg.text)}`
+        );
+      }
+      function refreshTypingUI() {
+        const el = document.getElementById("typingIndicator");
+        const p = peers.get(currentPeer);
+        if (!p || !p.typing) {
+          el.style.display = "none";
+          return;
+        }
+        el.style.display = "block";
+      }
 
-}
-function refreshTypingUI() {
-  const el = document.getElementById("typingIndicator");
-  const p = peers.get(currentPeer);
-  if (!p || !p.typing) {
-    el.style.display = "none";
-    return;
-  }
-  el.style.display = "block";
-}
+      function renderFileProgress(p, pct) {
+        const id = "fileprog-" + p._fileRx.id;
+        let el = document.getElementById(id);
+        if (!el)
+          appendLine(
+            `<span id="${id}" class="progress">Receiving ${p._fileRx.name} (0%)</span>`
+          );
+        else el.textContent = `Receiving ${p._fileRx.name} (${pct}%)`;
+      }
 
-function renderFileProgress(p, pct) {
-  const id = "fileprog-" + p._fileRx.id;
-  let el = document.getElementById(id);
-  if (!el) appendLine(`<span id="${id}" class="progress">Receiving ${p._fileRx.name} (0%)</span>`);
-  else el.textContent = `Receiving ${p._fileRx.name} (${pct}%)`;
-}
+      function renderFileLink(uid, name, url, ts) {
+        const color = stableColor(uid);
+        const p = peers.get(uid);
+        const sender =
+          uid === selfUID
+            ? window.us || uid.slice(0, 8)
+            : p?.username || uid.slice(0, 8);
+        appendLine(
+          `<span style="color:gray;">${formatTime(
+            ts
+          )}</span> <span class="sender" style="color:${color}">${sender}</span>: <a class="file" href="${url}" download="${name}">${name}</a>`
+        );
+      }
 
-function renderFileLink(uid, name, url, ts) {
-  const color = stableColor(uid);
-  const p = peers.get(uid);
-  const sender = (uid === selfUID ? (window.us || uid.slice(0,8)) : (p?.username || uid.slice(0,8)));
-  appendLine(`<span style="color:gray;">${formatTime(ts)}</span> <span class="sender" style="color:${color}">${sender}</span>: <a class="file" href="${url}" download="${name}">${name}</a>`);
-}
+      function showReplyIndicator(msg) {
+        const el = document.getElementById("replyIndicator");
+        const color = stableColor(msg.from);
+        el.innerHTML = `Replying to <span style="color:${color}">${msg.from.slice(
+          0,
+          8
+        )}</span>`;
+        el.style.display = "block";
+      }
 
-function showReplyIndicator(msg) {
-  const el = document.getElementById("replyIndicator");
-  const color = stableColor(msg.from);
-  el.innerHTML = `Replying to <span style="color:${color}">${msg.from.slice(0,8)}</span>`;
-  el.style.display = "block";
-}
+      function clearReplyIndicator() {
+        replyTo = null;
+        const el = document.getElementById("replyIndicator");
+        el.style.display = "none";
+      }
 
-function clearReplyIndicator() {
-  replyTo = null;
-  const el = document.getElementById("replyIndicator");
-  el.style.display = "none";
-}
+      function renderPeers() {
+        peersDiv.innerHTML = "";
+        for (const p of peers.values()) {
+          ensurePeerState(p);
+          if (p.uid == selfUID) {
+            continue;
+          }
+          const d = document.createElement("div");
+          d.className = "peer" + (currentPeer === p.uid ? " active" : "");
+          const unread = p.unread || 0;
+          const typingLabel = p.typing ? "typing..." : "";
+          const displayName = p.username || p.uid.slice(0, 8);
 
-/* ================= PEERS UI ================= */
-function renderPeers() {
-  peersDiv.innerHTML = "";
-  for (const p of peers.values()) {
-    ensurePeerState(p);
-    if(p.uid == selfUID) {
-      continue;
-    };
-    const d = document.createElement("div");
-    d.className = "peer" + (currentPeer === p.uid ? " active" : "");
-    const unread = p.unread || 0;
-    const typingLabel = p.typing ? "typing..." : "";
-    const displayName = p.username || p.uid.slice(0,8);
-
-    d.innerHTML = `
+          d.innerHTML = `
       <b>${displayName}</b><br>
-      <small>${p.state} / ${p.rtc} ${typingLabel} ${unread ? `(${unread})` : ""}</small><br><small>${p.pc ? (p.pc.iceConnectionState == "failed" ? "failed" : "") : ""}</small>
-      <button ${p._rtcLock ? "disabled" : ""} onclick="connectPeer('${p.uid}')">Connect</button>
-      ${p.offer && !p._rtcLock ? `<button onclick="acceptPeer('${p.uid}')">Accept Offer</button>` : ""}
+      <small>${p.state} / ${p.rtc} ${typingLabel} ${
+            unread ? `(${unread})` : ""
+          }</small><br><small>${
+            p.pc ? (p.pc.iceConnectionState == "failed" ? "failed" : "") : ""
+          }</small>
+      <button ${p._rtcLock ? "disabled" : ""} onclick="connectPeer('${
+            p.uid
+          }')">Connect</button>
+      ${
+        p.offer && !p._rtcLock
+          ? `<button onclick="acceptPeer('${p.uid}')">Accept Offer</button>`
+          : ""
+      }
       <button onclick="openChat('${p.uid}')">Open</button>
     `;
 
-    peersDiv.appendChild(d);
-  }
-}
+          peersDiv.appendChild(d);
+        }
+      }
 
-document.addEventListener("keydown", e => {
-  if (e.key === "Escape") clearReplyIndicator();
-});
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") clearReplyIndicator();
+      });
 
+      async function connectPeer(uid) {
+        const p = peers.get(uid);
+        ensurePeerState(p);
+        if (p._rtcLock || p.pc) return;
 
-/* ================= RTC ACTIONS ================= */
-async function connectPeer(uid) {
-  const p = peers.get(uid);
-  ensurePeerState(p);
-  if (p._rtcLock || p.pc) return;
+        p._rtcLock = true;
+        renderPeers();
+        await makeOffer(p);
+      }
 
-  p._rtcLock = true;
-  renderPeers();
-  await makeOffer(p);
-}
+      async function acceptPeer(uid) {
+        const p = peers.get(uid);
+        ensurePeerState(p);
+        if (p._rtcLock || p.pc || !p.offer) return;
 
-async function acceptPeer(uid) {
-  const p = peers.get(uid);
-  ensurePeerState(p);
-  if (p._rtcLock || p.pc || !p.offer) return;
+        p._rtcLock = true;
+        renderPeers();
+        await takeOffer(p, p.offer);
+      }
 
-  p._rtcLock = true;
-  renderPeers();
-  await takeOffer(p, p.offer);
-}
+      function openChat(uid) {
+        currentPeer = uid;
+        msgs.innerHTML = "";
+        const p = peers.get(uid);
+        ensurePeerState(p);
+        p.lastOpened = Date.now();
+        p.unread = 0;
 
-/* ================= CHAT ================= */
-function openChat(uid) {
-  currentPeer = uid;
-  msgs.innerHTML = "";
-  const p = peers.get(uid);
-  ensurePeerState(p);
-  p.lastOpened = Date.now();
-  p.unread = 0;
+        for (const m of p.chat) {
+          if (m.type === "chat") renderChatMessage(m);
+          if (m.file) renderFileLink(uid, m.name, m.url, m.ts);
+        }
 
+        if (p.chan) bindChannel(p);
+        setChatEnabled(p.chan?.readyState === "open");
+        renderPeers();
+        const p2 = peers.get(uid);
+        p2.typing = false;
+        refreshTypingUI();
+      }
 
-  for (const m of p.chat) {
-    if (m.type === "chat") renderChatMessage(m);
-    if (m.file) renderFileLink(uid, m.name, m.url, m.ts);
-  }
+      document.querySelector("#msg").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          if (e.shiftKey) {
+            e.preventDefault();
+            const el = e.target;
+            const start = el.selectionStart;
+            const end = el.selectionEnd;
+            const v = el.value;
+            el.value = v.slice(0, start) + "\n" + v.slice(end);
+            el.selectionStart = el.selectionEnd = start + 1;
+            resizeMsg();
+          } else {
+            e.preventDefault();
+            sendBtn.onclick();
+          }
+        }
+      });
 
-  if (p.chan) bindChannel(p);
-  setChatEnabled(p.chan?.readyState === "open");
-  renderPeers();
-  const p2 = peers.get(uid);
-  p2.typing = false;
-  refreshTypingUI();
-}
+      sendBtn.onclick = async () => {
+        const p = peers.get(currentPeer);
+        if (!p?.chan || p.chan.readyState !== "open") return;
 
-document.querySelector("#msg").addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    sendBtn.onclick();
-  }
-});
+        const text = msgInput.value.trim();
+        if (!text) return;
+        msgInput.value = "";
+        resizeMsg();
 
-/* ================= SEND ================= */
-sendBtn.onclick = async () => {
-  const p = peers.get(currentPeer);
-  if (!p?.chan || p.chan.readyState !== "open") return;
+        const msg = {
+          type: "chat",
+          id: randId(),
+          ts: Date.now(),
+          from: selfUID,
+          username: window.us || null,
+          text,
+          replyTo: replyTo?.id || null,
+        };
 
-  const text = msgInput.value.trim();
-  if (!text) return;
-  msgInput.value = "";
+        clearReplyIndicator();
 
-  const msg = {
-  type: "chat",
-  id: randId(),
-  ts: Date.now(),
-  from: selfUID,
-  username: window.us || null,
-  text,
-  replyTo: replyTo?.id || null
-};
+        p.chan.send(JSON.stringify(await encrypt(p.key, msg)));
+        p.chat.push(msg);
+        renderChatMessage(msg);
+      };
 
-clearReplyIndicator();
+      sendFileBtn.onclick = () => fileInput.click();
 
-  p.chan.send(JSON.stringify(await encrypt(p.key, msg)));
-  p.chat.push(msg);
-  renderChatMessage(msg);
-};
+      fileInput.onchange = async () => {
+        const file = fileInput.files[0];
+        fileInput.value = "";
+        const p = peers.get(currentPeer);
+        if (!file || !p?.chan || p.chan.readyState !== "open") return;
 
-sendFileBtn.onclick = () => fileInput.click();
+        const meta = {
+          type: "file-meta",
+          id: randId(),
+          ts: Date.now(),
+          name: file.name,
+          size: file.size,
+          mime: file.type,
+          from: selfUID,
+        };
+        p.chan.send(JSON.stringify(await encrypt(p.key, meta)));
 
-fileInput.onchange = async () => {
-  const file = fileInput.files[0];
-  fileInput.value = "";
-  const p = peers.get(currentPeer);
-  if (!file || !p?.chan || p.chan.readyState !== "open") return;
+        const buf = await file.arrayBuffer();
+        for (let i = 0; i < buf.byteLength; i += CHUNK_SIZE)
+          p.chan.send(buf.slice(i, i + CHUNK_SIZE));
+        p.chan.send(JSON.stringify(await encrypt(p.key, { type: "file-end" })));
 
-  const meta = { type:"file-meta", id:randId(), ts:Date.now(), name:file.name, size:file.size, mime:file.type, from:selfUID };
-  p.chan.send(JSON.stringify(await encrypt(p.key, meta)));
+        const url = URL.createObjectURL(file);
+        p.chat.push({
+          file: true,
+          name: file.name,
+          url,
+          ts: meta.ts,
+          from: selfUID,
+        });
+        renderFileLink(selfUID, file.name, url, meta.ts);
+      };
 
-  const buf = await file.arrayBuffer();
-  for (let i = 0; i < buf.byteLength; i += CHUNK_SIZE) p.chan.send(buf.slice(i, i + CHUNK_SIZE));
-  p.chan.send(JSON.stringify(await encrypt(p.key, { type: "file-end" })));
+      msgInput.addEventListener("input", () => {
+        resizeMsg();
+        const p = peers.get(currentPeer);
+        if (!p?.chan || p.chan.readyState !== "open") return;
 
-  const url = URL.createObjectURL(file);
-  p.chat.push({ file: true, name: file.name, url, ts: meta.ts, from: selfUID });
-  renderFileLink(selfUID, file.name, url, meta.ts);
-};
+        if (msgInput.value !== lastInputValue) {
+          lastInputValue = msgInput.value;
+          sendTypingState(p, "typing");
 
-msgInput.addEventListener("input", () => {
-  const p = peers.get(currentPeer);
-  if (!p?.chan || p.chan.readyState !== "open") return;
+          clearTimeout(typingTimers[currentPeer]);
+          typingTimers[currentPeer] = setTimeout(() => {
+            if (!msgInput.value) sendTypingState(p, "idle");
+          }, 1000);
 
-  if (msgInput.value !== lastInputValue) {
-    lastInputValue = msgInput.value;
-    sendTypingState(p, "typing");
+          typingTimers[currentPeer + "_idle"] = setTimeout(() => {
+            sendTypingState(p, "idle");
+          }, 5000);
+        }
+      });
 
-    clearTimeout(typingTimers[currentPeer]);
-    typingTimers[currentPeer] = setTimeout(() => {
-      if (!msgInput.value) sendTypingState(p, "idle");
-    }, 1000);
+      async function sendTypingState(p, action) {
+        const pkt = { type: "typing", action, from: selfUID, ts: Date.now() };
+        p.chan.send(JSON.stringify(await encrypt(p.key, pkt)));
+      }
 
-    typingTimers[currentPeer + "_idle"] = setTimeout(() => {
-      sendTypingState(p, "idle");
-    }, 5000);
-  }
-});
-
-async function sendTypingState(p, action) {
-  const pkt = { type: "typing", action, from: selfUID, ts: Date.now() };
-  p.chan.send(JSON.stringify(await encrypt(p.key, pkt)));
-}
-
-/* ================= START ================= */
-setInterval(renderPeers, 500);
-</script>
-
-</body>
+      setInterval(renderPeers, 500);
+    </script>
+  </body>
 </html>
